@@ -7,13 +7,17 @@ use solana_program::{
     borsh::try_from_slice_unchecked,
     entrypoint::ProgramResult,
     msg,
+    native_token::LAMPORTS_PER_SOL,
     program::invoke_signed,
     program_error::ProgramError,
     program_pack::IsInitialized,
     pubkey::Pubkey,
     system_instruction,
-    sysvar::{rent::Rent, Sysvar},
+    system_program::ID as SYSTEM_PROGRAM_ID,
+    sysvar::{rent::Rent, rent::ID as RENT_PROGRAM_ID, Sysvar},
 };
+use spl_associated_token_account::get_associated_token_address;
+use spl_token::{instruction::initialize_mint, ID as TOKEN_PROGRAM_ID};
 use std::convert::TryInto;
 
 pub fn process_instruction(
@@ -34,7 +38,92 @@ pub fn process_instruction(
             description,
         } => update_movie_review(program_id, accounts, title, rating, description),
         MovieInstruction::AddComment { comment } => add_comment(program_id, accounts, comment),
+        MovieInstruction::InitializeMint => mint_token(program_id, accounts),
     }
+}
+
+fn mint_token(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
+    let account_info_iter = &mut accounts.iter();
+
+    let initializer = next_account_info(account_info_iter)?;
+    let token_mint = next_account_info(account_info_iter)?;
+    let mint_authority = next_account_info(account_info_iter)?;
+    let system_program = next_account_info(account_info_iter)?;
+    let rent_program = next_account_info(account_info_iter)?;
+    let token_program = next_account_info(account_info_iter)?;
+
+    // validate the token mint with "token_mint"
+    let (pda_mint, mint_bump) = Pubkey::find_program_address(&[b"token_mint"], program_id);
+    let (mint_auth_pda, _mint_auth_bump) =
+        Pubkey::find_program_address(&[b"token_auth"], program_id);
+
+    msg!("Token mint: {:?}", pda_mint);
+    msg!("Mint authority: {:?}", mint_auth_pda);
+
+    // Check for valid accounts
+    if pda_mint != *token_mint.key {
+        msg!("invalid account for token mint");
+        return Err(ProgramError::InvalidAccountData);
+    }
+    if mint_auth_pda != *mint_authority.key {
+        msg!("invalid account for mint authority");
+        return Err(ProgramError::InvalidAccountData);
+    }
+    msg!("invalid account for System program");
+    if *system_program.key != SYSTEM_PROGRAM_ID {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    if *rent_program.key != RENT_PROGRAM_ID {
+        msg!("invalid account for Rent program");
+        return Err(ProgramError::InvalidAccountData);
+    }
+    if *token_program.key != TOKEN_PROGRAM_ID {
+        msg!("invalid account for Token program");
+        return Err(ProgramError::InvalidAccountData);
+    }
+
+    let rent = Rent::get()?;
+    let rent_lamports = rent.minimum_balance(82);
+
+    invoke_signed(
+        &system_instruction::create_account(
+            initializer.key,
+            token_mint.key,
+            rent_lamports,
+            82,
+            mint_authority.key,
+        ),
+        &[
+            initializer.clone(),
+            system_program.clone(),
+            token_mint.clone(),
+        ],
+        &[&[b"token_mint", &[mint_bump]]],
+    )?;
+
+    msg!("Token Mint created");
+
+    invoke_signed(
+        &initialize_mint(
+            token_program.key,
+            token_mint.key,
+            mint_authority.key,
+            Option::None,
+            9,
+        )?,
+        // Which accounts we're reading from or writing to
+        &[
+            token_mint.clone(),
+            rent_program.clone(),
+            mint_authority.clone(),
+        ],
+        // The seeds for our token mint PDA
+        &[&[b"token_mint", &[mint_bump]]],
+    )?;
+
+    msg!("Initialized token mint");
+
+    Ok(())
 }
 
 fn add_comment(
@@ -53,6 +142,10 @@ fn add_comment(
     let pda_counter = next_account_info(account_info_iter)?;
     let pda_comment = next_account_info(account_info_iter)?;
     let system_program = next_account_info(account_info_iter)?;
+    let token_mint = next_account_info(account_info_iter)?;
+    let mint_auth = next_account_info(account_info_iter)?;
+    let user_ata = next_account_info(account_info_iter)?;
+    let token_program = next_account_info(account_info_iter)?;
 
     let mut counter_data =
         try_from_slice_unchecked::<MovieCommentCounter>(&pda_counter.data.borrow()).unwrap();
@@ -118,6 +211,48 @@ fn add_comment(
 
     counter_data.serialize(&mut &mut pda_counter.data.borrow_mut()[..])?;
 
+    msg!("deriving mint authority");
+    let (mint_pda, _mint_bump) = Pubkey::find_program_address(&[b"token_mint"], program_id);
+    let (mint_auth_pda, mint_auth_bump) =
+        Pubkey::find_program_address(&[b"token_auth"], program_id);
+
+    if *token_mint.key != mint_pda {
+        msg!("Incorrect token mint");
+        return Err(ReviewError::IncorrectAccountError.into());
+    }
+
+    if *mint_auth.key != mint_auth_pda {
+        msg!("Mint passed in and mint derived do not match");
+        return Err(ReviewError::InvalidPDA.into());
+    }
+
+    if *user_ata.key != get_associated_token_address(commenter.key, token_mint.key) {
+        msg!("Incorrect token mint");
+        return Err(ReviewError::IncorrectAccountError.into());
+    }
+
+    if *token_program.key != TOKEN_PROGRAM_ID {
+        msg!("Incorrect token program");
+        return Err(ReviewError::IncorrectAccountError.into());
+    }
+
+    msg!("Minting 5 tokens to User associated token account");
+    invoke_signed(
+        // Instruction
+        &spl_token::instruction::mint_to(
+            token_program.key,
+            token_mint.key,
+            user_ata.key,
+            mint_auth.key,
+            &[],
+            5 * LAMPORTS_PER_SOL,
+        )?,
+        // Account_infos
+        &[token_mint.clone(), user_ata.clone(), mint_auth.clone()],
+        // Seeds
+        &[&[b"token_auth", &[mint_auth_bump]]],
+    )?;
+
     Ok(())
 }
 
@@ -140,6 +275,10 @@ pub fn add_movie_review(
     let system_program = next_account_info(account_info_iter)?;
     // Hold comment counter
     let pda_counter = next_account_info(account_info_iter)?;
+    let token_mint = next_account_info(account_info_iter)?;
+    let mint_auth = next_account_info(account_info_iter)?;
+    let user_ata = next_account_info(account_info_iter)?;
+    let token_program = next_account_info(account_info_iter)?;
 
     // Check if comment counter account is pad okay
     let (counter_pda, counter_bump) =
@@ -172,6 +311,31 @@ pub fn add_movie_review(
     if MovieAccountState::get_account_size(title.clone(), description.clone()) > 1000 {
         msg!("Data length is larger than 1000 bytes");
         return Err(ReviewError::InvalidDataLength.into());
+    }
+
+    msg!("deriving mint authority");
+    let (mint_pda, _mint_bump) = Pubkey::find_program_address(&[b"token_mint"], program_id);
+    let (mint_auth_pda, mint_auth_bump) =
+        Pubkey::find_program_address(&[b"token_auth"], program_id);
+
+    if *token_mint.key != mint_pda {
+        msg!("Incorrect token mint");
+        return Err(ReviewError::IncorrectAccountError.into());
+    }
+
+    if *mint_auth.key != mint_auth_pda {
+        msg!("Mint passed in and mint derived do not match");
+        return Err(ReviewError::InvalidPDA.into());
+    }
+
+    if *user_ata.key != get_associated_token_address(initializer.key, token_mint.key) {
+        msg!("Incorrect token mint");
+        return Err(ReviewError::IncorrectAccountError.into());
+    }
+
+    if *token_program.key != TOKEN_PROGRAM_ID {
+        msg!("Incorrect token program");
+        return Err(ReviewError::IncorrectAccountError.into());
     }
 
     let account_len: usize =
@@ -265,6 +429,22 @@ pub fn add_movie_review(
 
     msg!("Comment counter init done");
 
+    msg!("Minting 10 tokens to User associated token account");
+    invoke_signed(
+        // Instruction
+        &spl_token::instruction::mint_to(
+            token_program.key,
+            token_mint.key,
+            user_ata.key,
+            mint_auth.key,
+            &[],
+            10 * LAMPORTS_PER_SOL,
+        )?, // ? unwraps and returns the error if there is one
+        // Account_infos
+        &[token_mint.clone(), user_ata.clone(), mint_auth.clone()],
+        // Seeds
+        &[&[b"token_auth", &[mint_auth_bump]]],
+    )?;
     Ok(())
 }
 

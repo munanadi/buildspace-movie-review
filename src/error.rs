@@ -14,6 +14,9 @@ pub enum ReviewError {
 
     #[error("Rating greater than 5 or less than 1")]
     InvalidRating,
+
+    #[error("Passed the wrong account")]
+    IncorrectAccountError,
 }
 
 impl From<ReviewError> for ProgramError {
